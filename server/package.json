@@ -4,6 +4,10 @@
   "type": "module",
   "main": "server.js",
   "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "ts-node --project ./tsconfig.json ./src/server.ts",
