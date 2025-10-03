@@ -1,16 +1,16 @@
 import { createServer } from 'http';
 import express from 'express';
 import WebSocket, { WebSocketServer } from 'ws';
-import { PrismaClient } from '@prisma/client';
+import { client } from '@repo/db';
 import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 dotenv.config();
-const prisma = new PrismaClient();
+const prisma = client;
 const port = 8080;
 const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ noServer: true });
-const client = new Map();
+const clients = new Map();
 async function broadcastMsg(chatId, msg, excludeuserId) {
     const participant = await prisma.chatParticipant.findMany({
         where: {
@@ -23,7 +23,7 @@ async function broadcastMsg(chatId, msg, excludeuserId) {
     for (const { userId } of participant) {
         if (userId === excludeuserId)
             continue;
-        const clientData = client.get(userId);
+        const clientData = clients.get(userId);
         if (!clientData)
             continue;
         const { socket } = clientData;
@@ -39,20 +39,32 @@ async function notifyPresence(userId, isAlive) {
         event: "system",
         payload: { userId, isAlive }
     });
-    client.forEach((c, id) => {
+    clients.forEach((c, id) => {
         if (id !== userId && c.socket.readyState === c.socket.OPEN) {
             c.socket.send(presenceMsg);
         }
     });
 }
 server.on("upgrade", (req, socket, head) => {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-        wss.emit("connection", ws, req);
-    });
+    try {
+        wss.handleUpgrade(req, socket, head, (ws) => {
+            wss.emit("connection", ws, req);
+        });
+    }
+    catch (err) {
+        socket.destroy();
+    }
 });
 wss.on('connection', async (socket, req) => {
     const url = new URL(req.url || "", `http://${req.headers.host}`);
     const tokenFromQuery = url.searchParams.get("token");
+    if (!tokenFromQuery) {
+        socket.close(1008, "No token provided");
+        return;
+    }
+    if (!process.env.NEXTAUTH_SECRET) {
+        throw new Error("NEXTAUTH_SECRET is not defined");
+    }
     let verification;
     try {
         verification = jwt.verify(tokenFromQuery, process.env.NEXTAUTH_SECRET);
@@ -64,17 +76,16 @@ wss.on('connection', async (socket, req) => {
     if (!verification) {
         socket.send(JSON.stringify({ type: "Error", message: "Error while decoding" }));
     }
-    if (!tokenFromQuery) {
-        socket.send(JSON.stringify({ type: "Error", message: "Error" }));
-    }
     const senderId = verification.id;
-    client.set(senderId, { socket, isAlive: true });
+    clients.set(senderId, { socket, isAlive: true });
     socket.on("pong", () => {
-        const c = client.get(senderId);
-        if (c) {
-            c.isAlive = true;
+        const c = clients.get(senderId);
+        if (c && !c.isAlive) {
+            // only broadcast when status changes
             notifyPresence(senderId, true);
         }
+        if (c)
+            c.isAlive = true;
     });
     let msg;
     socket.on('message', async (data) => {
@@ -102,29 +113,35 @@ wss.on('connection', async (socket, req) => {
             }, saved.senderId);
         }
     });
-    socket.on('close', async () => {
-        const lastSeen = await prisma.lastSeen.create({
-            data: {
-                userId: senderId,
-                time: new Date()
-            }
-        });
-        console.log("Client disconnected");
+    socket.on("close", async () => {
+        clients.delete(senderId);
+        notifyPresence(senderId, false);
+        try {
+            await prisma.lastSeen.create({
+                data: { userId: senderId, time: new Date() }
+            });
+        }
+        catch (e) {
+            console.error("Failed to save lastSeen", e);
+        }
+    });
+    socket.on("error", (err) => {
+        console.error(`Socket error for ${senderId}`, err);
     });
 });
 setInterval(() => {
-    client.forEach((c, userId) => {
+    clients.forEach((c, userId) => {
         if (!c.isAlive) {
             console.log(`user is not responding`);
             c.socket.terminate();
-            client.delete(userId);
+            clients.delete(userId);
             notifyPresence(userId, false);
             return;
         }
         c.isAlive = false;
         c.socket.ping();
     });
-}, 5000);
+}, 30000);
 server.listen(port, () => {
     console.log(`Server is connected on the Port ${port}`);
 });
